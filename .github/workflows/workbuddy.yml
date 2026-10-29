@@ -33,6 +33,14 @@ jobs:
       - name: Install deps
         run: pip install requests
 
+      # 上游脚本的 auto_refresh() 在模块级调用 refresh_one()，而 uid_of() 定义在其后，
+      # 启动预检必然 NameError（日志显示「续期失败: err」）。这里显式走 main 的 --refresh
+      # 分支，此时模块已加载完毕，续期可正常完成；失败也不阻断后续任务。
+      - name: Refresh tokens
+        env:
+          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+        run: python workbuddy_daily.py --refresh || true
+
       - name: Restore benefit guard
         uses: actions/cache@v4
         with:
