@@ -1,0 +1,102 @@
+name: ⏰ 凭据到期提醒
+
+# 独立于签到任务：只检查 Secret 里 refresh token 的 exp，临近到期时通过 WxPusher 提醒。
+# 之所以需要它：本仓是公开仓，wb_refresh_tokens.json 不能提交，续期产生的新 RT 无法
+# 持久化，因此 Secret 里那份 RT 的到期日就是硬期限，过期后签到会整体失效。
+
+on:
+  schedule:
+    - cron: '0 1 * * *'        # 每天 09:00 北京时间
+  workflow_dispatch:
+    inputs:
+      warn_days:
+        description: '提前多少天开始提醒'
+        required: false
+        default: '14'
+      force:
+        description: '无论是否临近到期都发一条（用于验证通道）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check refresh token expiry
+        env:
+          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WARN_DAYS: ${{ inputs.warn_days || '14' }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          python3 - <<'PY'
+          import base64, datetime, json, math, os, sys, time, urllib.request
+
+          raw = os.environ.get("WORKBUDDY_REFRESH_TOKEN", "").strip()
+          warn_days = int(os.environ.get("WARN_DAYS") or 14)
+          force = str(os.environ.get("FORCE", "")).strip().lower() == "true"
+
+          def payload(tok):
+              try:
+                  p = tok.split(".")[1]
+                  p += "=" * (-len(p) % 4)
+                  return json.loads(base64.urlsafe_b64decode(p))
+              except Exception:
+                  return {}
+
+          rows, alert = [], False
+          today = datetime.datetime.utcnow().date()
+          for idx, line in enumerate([x.strip() for x in raw.replace("@", "\n").splitlines() if x.strip()], 1):
+              parts = [x.strip() for x in line.split(":")]
+              phone = parts[0] if len(parts) >= 2 else "账号%d" % idx
+              exp = int(payload(parts[-1]).get("exp") or 0)
+              if not exp:
+                  rows.append("%s：无法解析到期时间（凭据格式异常）" % phone)
+                  alert = True
+                  continue
+              due = datetime.datetime.utcfromtimestamp(exp).date()
+              days = (due - today).days
+              if days <= 0:
+                  rows.append("%s：已过期（%s）" % (phone, due))
+                  alert = True
+              else:
+                  rows.append("%s：剩 %d 天（%s 到期）" % (phone, days, due))
+                  # 只在 14/7/3/1 天这几个节点提醒，避免每天刷屏
+                  if days <= warn_days and days in (warn_days, 7, 3, 1):
+                      alert = True
+
+          print("当前状态：")
+          for r in rows:
+              print("  " + r)
+
+          if not (alert or force):
+              print("\n未到提醒节点（阈值 %d 天），本次不推送" % warn_days)
+              sys.exit(0)
+
+          content = (
+              "⏰ WorkBuddy 凭据到期提醒\n\n"
+              + "\n".join(rows)
+              + "\n\n处理方式：运行 workbuddy_login.py 重新登录，把输出的新凭据（手机号:AT:RT）"
+                "更新到 wuge0/wbd-daily 的 Secret「WORKBUDDY_REFRESH_TOKEN」。\n"
+                "https://github.com/wuge0/wbd-daily/settings/secrets/actions"
+          )
+          body = json.dumps({
+              "appToken": os.environ["WXPUSHER_APP_TOKEN"],
+              "content": content,
+              "summary": "WorkBuddy 凭据到期提醒",
+              "contentType": 1,
+              "uids": [u.strip() for u in os.environ.get("WXPUSHER_UID", "").split(",") if u.strip()],
+          }).encode()
+          req = urllib.request.Request(
+              "https://wxpusher.zjiecode.com/api/send/message",
+              data=body, headers={"Content-Type": "application/json"})
+          resp = json.load(urllib.request.urlopen(req, timeout=20))
+          print("\n推送结果: code=%s msg=%s" % (resp.get("code"), resp.get("msg")))
+          if resp.get("code") != 1000:
+              sys.exit(1)
+          PY
