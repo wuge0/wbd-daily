@@ -75,7 +75,9 @@ jobs:
           import json
           import os
           import sys
+          import re
           import urllib.error
+          import urllib.request
 
           spec = importlib.util.spec_from_file_location("cr", "credits_report.py")
           cr = importlib.util.module_from_spec(spec)
@@ -173,9 +175,32 @@ jobs:
               print("\n无 %d 天内到期、今天也不是周一，跳过推送" % days)
               sys.exit(0)
 
-          ok = cr.wxpusher(os.environ.get("WXPUSHER_APP_TOKEN", "").strip(),
-                           os.environ.get("WXPUSHER_UID", "").strip(),
-                           "💰 积分播报", body)
+          # cr.wxpusher() 会把标题和正文首行拼成 summary，通知栏里就会出现
+          # 「💰 积分播报 ⚠️ 688.22 分 5 天后失效 · 17*******02」这种超长标题。
+          # 这里自建推送，summary 固定为短标题，具体信息留给正文。
+          def push(app_token, uid_raw, title, content):
+              uids = [u.strip() for u in re.split(r"[,;，\s]+", uid_raw or "") if u.strip()]
+              if not app_token or not uids:
+                  print("⚠️ 未配置 WXPUSHER_APP_TOKEN / WXPUSHER_UID，跳过推送")
+                  return False
+              payload = {"appToken": app_token, "content": content, "summary": title,
+                         "contentType": 1, "uids": uids, "verifyPayType": 0}
+              req = urllib.request.Request(cr.WXPUSHER_URL, method="POST",
+                                           data=json.dumps(payload).encode("utf-8"),
+                                           headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=20, context=cr.CTX) as resp:
+                  d = json.loads(resp.read().decode("utf-8", "replace"))
+              if d.get("code") != 1000:
+                  print("推送失败:", str(d.get("msg"))[:80])
+                  return False
+              items = d.get("data") or []
+              print("推送成功: %d/%d 个接收人" % (len([x for x in items if x.get("code") == 1000]), len(items)))
+              return True
+
+
+          ok = push(os.environ.get("WXPUSHER_APP_TOKEN", "").strip(),
+                    os.environ.get("WXPUSHER_UID", "").strip(),
+                    "💰 积分播报", body)
           print("\n推送结果:", ok)
           sys.exit(0 if ok else 1)
           PY
