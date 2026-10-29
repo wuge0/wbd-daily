@@ -1,9 +1,8 @@
-name: 💰 积分到期播报
+name: 💰 积分播报
 
-# 调用仓库自带的 credits_report.py：
-#   · 月度套餐（CapacityType=4）每月 1 日重置，当月最后一天 23:59:59 清零、不结转
-#   · 活动赠送（CapacityType=1）逐笔发放，领取后 30 天独立到期
-# 有到期预警时每天推送；无预警时只在周一推一次余额，避免刷屏。
+# 取数用仓库自带的 credits_report.py（余额 + 逐笔到期），排版与推送在本工作流内完成。
+# 到期口径：赠送积分（CapacityType=1）领取后 30 天逐笔到期；月包（=4）每月 1 日重置、月底清零。
+# 有预警 → 每天推；无预警 → 只在周一推一次余额快照，平时静默。
 
 on:
   schedule:
@@ -63,7 +62,7 @@ jobs:
           print("store 账号数:", len(store))
           PY
 
-      - name: Credits expiry report
+      - name: Credits report
         env:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
@@ -71,36 +70,112 @@ jobs:
           FORCE: ${{ inputs.force || 'false' }}
         run: |
           python3 - <<'PY'
-          import datetime, importlib.util, os, sys
+          import datetime
+          import importlib.util
+          import json
+          import os
+          import sys
+          import urllib.error
 
           spec = importlib.util.spec_from_file_location("cr", "credits_report.py")
           cr = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(cr)
 
+          store = json.load(open("wb_refresh_tokens.json", encoding="utf-8"))
+          now = datetime.datetime.now()
           days = int(os.environ.get("DAYS") or 7)
           force = str(os.environ.get("FORCE", "")).strip().lower() == "true"
 
-          try:
-              body, warns = cr.report_cn("wb_refresh_tokens.json", days)
-          except Exception as exc:
-              print("❌ 报告生成失败:", exc)
-              sys.exit(1)
 
+          def fmt(n):
+              return ("%.0f" % n) if abs(n - round(n)) < 0.005 else ("%.2f" % n).rstrip("0").rstrip(".")
+
+
+          blocks, alerts, grand = [], [], 0.0
+          for user, ent in store.items():
+              at = (ent or {}).get("access_token", "")
+              rt = (ent or {}).get("refresh_token", "")
+              label = cr.mask_phone(user)
+              try:
+                  try:
+                      accounts = cr.fetch_accounts("https://copilot.tencent.com", at)
+                  except urllib.error.HTTPError as e:
+                      if e.code != 401 or not rt:
+                          raise
+                      at, rt = cr.refresh_cn(rt, at)
+                      accounts = cr.fetch_accounts("https://copilot.tencent.com", at)
+                  summary = cr.fetch_summary("https://copilot.tencent.com", at)
+                  total = sum(cr.f(p.get("CycleRemainCapacity")) for p in (summary.get("Packages") or []))
+                  grand += total
+              except Exception as e:
+                  blocks.append("📱 %s\n   查询失败：%s" % (label, str(e)[:40]))
+                  continue
+
+              live = []
+              for a in accounts:
+                  if not isinstance(a, dict):
+                      continue
+                  monthly = cr._is_monthly(a)
+                  remain = cr._account_remain(a, monthly)
+                  if remain is None or remain <= 0:
+                      continue
+                  end = cr._account_end(a, monthly)
+                  if not end or (not monthly and end <= now):
+                      continue
+                  live.append((remain, monthly, end))
+              live.sort(key=lambda x: x[2])
+
+              buckets = []
+              for remain, monthly, dt in live:
+                  if buckets and buckets[-1][0] == dt:
+                      buckets[-1][1] += remain
+                      buckets[-1][2] = buckets[-1][2] or monthly
+                  else:
+                      buckets.append([dt, remain, monthly])
+
+              lines = ["📱 %s · 余额 %s" % (label, fmt(total))]
+              horizon = now + datetime.timedelta(days=days)
+              soon = [b for b in buckets if b[0] <= horizon]
+              later = [b for b in buckets if b[0] > horizon]
+
+              if soon:
+                  amt = sum(b[1] for b in soon)
+                  lines.append("⚠️ %s 起 · %d 日内 %d 笔 %s 分" % (
+                      soon[0][0].strftime("%m-%d"), days, len(soon), fmt(amt)))
+              nxt = next((b for b in later if not b[2]), None)
+              if nxt:
+                  lines.append("   下一笔 %s · %s 分" % (nxt[0].strftime("%m-%d"), fmt(nxt[1])))
+              last = buckets[-1][0].strftime("%m-%d")
+              if last not in [c for c in (soon[0][0].strftime("%m-%d") if soon else "",
+                                          nxt[0].strftime("%m-%d") if nxt else "")]:
+                  lines.append("   %s 全部到期" % last)
+              blocks.append("\n".join(lines))
+
+              if soon:
+                  alerts.append((soon[0][0], sum(b[1] for b in soon), label))
+
+          alerts.sort(key=lambda x: x[0])
+          if alerts:
+              dt, amt, lab = alerts[0]
+              left = (dt.date() - now.date()).days
+              head = "⚠️ %s 分%s失效 · %s" % (
+                  fmt(amt), "今天" if left <= 0 else " %d 天后" % left, lab)
+              stamp = now.strftime("%m-%d %H:%M")
+              body = "\n".join([head, stamp, ""]) + "\n" + "\n\n".join(blocks)
+          else:
+              head = "%s · %d 个账号 · 合计 %s 分" % (now.strftime("%m-%d %H:%M"), len(store), fmt(grand))
+              body = "\n".join([head, ""]) + "\n" + "\n\n".join(blocks)
+          print("")
           print(body)
-          if warns:
-              print("\n--- 预警 ---")
-              for w in warns:
-                  print(w)
 
           is_monday = datetime.datetime.now(datetime.timezone.utc).weekday() == 0
-          if not (warns or is_monday or force):
-              print("\n无 7 天内到期、今天也不是周一，跳过推送")
+          if not (alerts or is_monday or force):
+              print("\n无 %d 天内到期、今天也不是周一，跳过推送" % days)
               sys.exit(0)
 
-          payload = ("\n".join(warns) + "\n\n" + body) if warns else body
           ok = cr.wxpusher(os.environ.get("WXPUSHER_APP_TOKEN", "").strip(),
                            os.environ.get("WXPUSHER_UID", "").strip(),
-                           "💰 积分到期播报", payload)
+                           "💰 积分播报", body)
           print("\n推送结果:", ok)
           sys.exit(0 if ok else 1)
           PY
