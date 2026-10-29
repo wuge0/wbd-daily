@@ -36,14 +36,22 @@ jobs:
           tar xzf /tmp/upstream.tar.gz -C /tmp/upstream --strip-components=1
           echo "上游文件数: $(find /tmp/upstream -type f | wc -l)"
 
-      - name: Sync files
+      - name: Sync files (python only)
         run: |
           set -euo pipefail
+          # 只同步 .py：其余文件（README / LICENSE / CHANGELOG / requirements / workflows / assets）
+          # 全部排除，既不会被覆盖，也不会因 --delete 被删除。
           rsync -a --delete \
             --exclude='.git/' \
-            --exclude='.github/workflows/sync-upstream.yml' \
+            --exclude='.github/' \
             --exclude='README.md' \
-            --exclude='assets/' \
+            --exclude='LICENSE' \
+            --exclude='.gitignore' \
+            --exclude='CHANGELOG.md' \
+            --exclude='requirements.txt' \
+            --include='*/' \
+            --include='*.py' \
+            --exclude='*' \
             /tmp/upstream/ ./
           git status --short | head -20
 
