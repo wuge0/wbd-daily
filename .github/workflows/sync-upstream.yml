@@ -1,0 +1,72 @@
+name: 🔄 同步上游
+
+# 每天 UTC 03:00（北京时间 11:00）自动把上游 L0NE-6/WorkBuddy-Daily 的 main 同步进本仓。
+# 说明：
+#   1. 通过 codeload 下载快照，避免 github.com 直连丢包导致的 clone 失败；
+#   2. README.md 与 workflow 本身被排除，不会被上游覆盖（保留本地脱敏版说明）；
+#   3. 上游删除的文件会一并删除（rsync --delete）。
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download upstream snapshot
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o /tmp/upstream.tar.gz \
+            https://codeload.github.com/L0NE-6/WorkBuddy-Daily/tar.gz/refs/heads/main
+          mkdir -p /tmp/upstream
+          tar xzf /tmp/upstream.tar.gz -C /tmp/upstream --strip-components=1
+          echo "上游文件数: $(find /tmp/upstream -type f | wc -l)"
+
+      - name: Sync files
+        run: |
+          set -euo pipefail
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/sync-upstream.yml' \
+            --exclude='README.md' \
+            --exclude='assets/' \
+            /tmp/upstream/ ./
+          git status --short | head -20
+
+      - name: Desensitize
+        run: |
+          set -euo pipefail
+          # 1) 上游收款码目录一律不入库
+          rm -rf assets
+          # 2) 清掉脚本内的赞赏引导语（上游每次同步都会覆盖回来，故每次重做）
+          if [ -f workbuddy_daily.py ]; then
+            sed -i 's/如帮到你，欢迎在仓库 README「☕ 支持与投喂」请我喝杯咖啡/如帮到你，欢迎给上游项目点个 Star/g' workbuddy_daily.py
+          fi
+          echo "脱敏检查：assets=$(test -d assets && echo 存在 || echo 已移除)  donate=$(grep -rc 'donate' --include='*.py' --include='*.md' . 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "✅ 上游无变化，跳过"
+            exit 0
+          fi
+          git commit -m "chore(sync): 同步上游 L0NE-6/WorkBuddy-Daily $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
