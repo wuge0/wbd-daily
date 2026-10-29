@@ -1,0 +1,106 @@
+name: 💰 积分到期播报
+
+# 调用仓库自带的 credits_report.py：
+#   · 月度套餐（CapacityType=4）每月 1 日重置，当月最后一天 23:59:59 清零、不结转
+#   · 活动赠送（CapacityType=1）逐笔发放，领取后 30 天独立到期
+# 有到期预警时每天推送；无预警时只在周一推一次余额，避免刷屏。
+
+on:
+  schedule:
+    - cron: '30 0 * * *'        # 每天 08:30 北京时间
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '到期预警窗口（天）'
+        required: false
+        default: '7'
+      force:
+        description: '无论有无预警都推送（用于验证通道）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # credits_report.py 只认 wb_refresh_tokens.json，这里从 Secret 现场生成，不落库
+      - name: Build token store
+        env:
+          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          raw = os.environ.get("WORKBUDDY_REFRESH_TOKEN", "").strip()
+          store = {}
+          for line in raw.replace("@", "\n").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              parts = line.split(":")
+              if len(parts) >= 3:
+                  phone, at, rt = parts[0], parts[1], parts[2]
+              elif len(parts) == 2:
+                  phone, at, rt = parts[0], "", parts[1]
+              else:
+                  continue
+              if rt or at:
+                  store[phone] = {"refresh_token": rt, "access_token": at}
+          if not store:
+              print("❌ 未解析出任何账号，检查 Secret 格式（手机号:AT:RT）")
+              sys.exit(1)
+          json.dump(store, open("wb_refresh_tokens.json", "w", encoding="utf-8"),
+                    ensure_ascii=False, indent=1)
+          print("store 账号数:", len(store))
+          PY
+
+      - name: Credits expiry report
+        env:
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          DAYS: ${{ inputs.days || '7' }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          python3 - <<'PY'
+          import datetime, importlib.util, os, sys
+
+          spec = importlib.util.spec_from_file_location("cr", "credits_report.py")
+          cr = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(cr)
+
+          days = int(os.environ.get("DAYS") or 7)
+          force = str(os.environ.get("FORCE", "")).strip().lower() == "true"
+
+          try:
+              body, warns = cr.report_cn("wb_refresh_tokens.json", days)
+          except Exception as exc:
+              print("❌ 报告生成失败:", exc)
+              sys.exit(1)
+
+          print(body)
+          if warns:
+              print("\n--- 预警 ---")
+              for w in warns:
+                  print(w)
+
+          is_monday = datetime.datetime.now(datetime.timezone.utc).weekday() == 0
+          if not (warns or is_monday or force):
+              print("\n无 7 天内到期、今天也不是周一，跳过推送")
+              sys.exit(0)
+
+          payload = ("\n".join(warns) + "\n\n" + body) if warns else body
+          ok = cr.wxpusher(os.environ.get("WXPUSHER_APP_TOKEN", "").strip(),
+                           os.environ.get("WXPUSHER_UID", "").strip(),
+                           "💰 积分到期播报", payload)
+          print("\n推送结果:", ok)
+          sys.exit(0 if ok else 1)
+          PY
