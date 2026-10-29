@@ -41,6 +41,39 @@ jobs:
           WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
         run: python workbuddy_daily.py --refresh || true
 
+      # RT 是滚动令牌：续期产生的新 RT 若不回写，Secret 里那份就会一直用到过期为止。
+      # 这里用独立 PAT 把新凭据写回 Secret，形成闭环；公开仓不落任何明文。
+      - name: Persist rotated token
+        env:
+          PAT: ${{ secrets.WB_SECRET_PAT }}
+          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json, os
+          try:
+              store = json.load(open("wb_refresh_tokens.json", encoding="utf-8"))
+          except Exception:
+              print("未找到 wb_refresh_tokens.json，跳过回写")
+              raise SystemExit(0)
+          rows = ["%s:%s:%s" % (u, e.get("access_token", ""), e.get("refresh_token", ""))
+                  for u, e in store.items() if e.get("refresh_token")]
+          if not rows:
+              print("无可用凭据，跳过回写")
+              raise SystemExit(0)
+          open("/tmp/wb_new.txt", "w", encoding="utf-8").write("\n".join(rows) + "\n")
+          print("待回写账号数:", len(rows))
+          PY
+          NEW="$(cat /tmp/wb_new.txt 2>/dev/null || true)"
+          if [ -z "$NEW" ]; then echo "凭据为空，跳过"; exit 0; fi
+          if [ "$NEW" = "${WORKBUDDY_REFRESH_TOKEN:-}" ]; then echo "凭据未变化，跳过"; exit 0; fi
+          if GH_TOKEN="$PAT" gh secret set WORKBUDDY_REFRESH_TOKEN -R "$GITHUB_REPOSITORY" < /tmp/wb_new.txt; then
+            echo "✅ 新凭据已回写 Secret，滚动链打通"
+          else
+            echo "⚠️ 回写失败（PAT 权限不足或已过期），本次继续用旧凭据"
+          fi
+          rm -f /tmp/wb_new.txt
+
       - name: Restore benefit guard
         uses: actions/cache@v6
         with:
